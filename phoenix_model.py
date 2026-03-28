@@ -1,226 +1,198 @@
 import torch
 import torch.nn as nn
-from dataclasses import dataclass, field
-from typing import NamedTuple, Optional, Tuple
-
-
-@dataclass
-class HashConfig:
-    """Configuration for number of hash buckets per entity."""
-    num_user_hashes: int = 2
-    num_item_hashes: int = 2
-    num_author_hashes: int = 2
-
+import torch.nn.functional as F
+import math
+from dataclasses import dataclass
 
 @dataclass
-class RecsysEmbeddings:
-    """Pre-computed embedding tables from external lookup."""
-    user_embeddings: torch.Tensor
-    history_post_embeddings: torch.Tensor
-    candidate_post_embeddings: torch.Tensor
-    history_author_embeddings: torch.Tensor
-    candidate_author_embeddings: torch.Tensor
+class RecModelConfig:
+    """ Configuration parameters for the Recommendation Model """
+    vocab_size: int = 10000
+    embed_dim: int = 64
+    num_heads: int = 4
+    num_layers: int = 2
+    max_seq_len: int = 500
+    num_experts: int = 4
+    top_k: int = 2
+    num_categories: int = 100
+    dropout: float = 0.1
 
-
-class RecsysModelOutput(NamedTuple):
-    """Output structure of the recommendation model."""
-    logits: torch.Tensor
-
-
-@dataclass
-class RecsysBatch:
-    """Input batch for recommendation model."""
-    user_hashes: torch.Tensor
-    history_post_hashes: torch.Tensor
-    history_author_hashes: torch.Tensor
-    history_actions: torch.Tensor
-    history_product_surface: torch.Tensor
-    candidate_post_hashes: torch.Tensor
-    candidate_author_hashes: torch.Tensor
-    candidate_product_surface: torch.Tensor
-
-
-def block_user_reduce(
-    user_hashes: torch.Tensor,
-    user_embeddings: torch.Tensor,
-    num_user_hashes: int,
-    emb_size: int,
-    proj_weight: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reduce user features using hash + linear projection."""
-    B = user_embeddings.shape[0]
-    D = emb_size
-    user_embedding = user_embeddings.reshape(B, 1, num_user_hashes * D)
-    user_embedding = torch.matmul(user_embedding.to(proj_weight.dtype), proj_weight.t())
-    user_padding_mask = (user_hashes[:, 0] != 0).reshape(B, 1)
-    return user_embedding, user_padding_mask
-
-
-def block_history_reduce(
-    history_post_hashes: torch.Tensor,
-    history_post_embeddings: torch.Tensor,
-    history_author_embeddings: torch.Tensor,
-    history_product_surface_embeddings: torch.Tensor,
-    history_actions_embeddings: torch.Tensor,
-    num_item_hashes: int,
-    num_author_hashes: int,
-    proj_weight: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reduce history sequence features: post + author + action + surface."""
-    B, S, _, D = history_post_embeddings.shape
-    post_reshaped = history_post_embeddings.reshape(B, S, num_item_hashes * D)
-    author_reshaped = history_author_embeddings.reshape(B, S, num_author_hashes * D)
-    combined = torch.cat([
-        post_reshaped,
-        author_reshaped,
-        history_actions_embeddings,
-        history_product_surface_embeddings
-    ], dim=-1)
-    history_embedding = torch.matmul(combined.to(proj_weight.dtype), proj_weight.t())
-    history_padding_mask = (history_post_hashes[:, :, 0] != 0)
-    return history_embedding, history_padding_mask
-
-
-def block_candidate_reduce(
-    candidate_post_hashes: torch.Tensor,
-    candidate_post_embeddings: torch.Tensor,
-    candidate_author_embeddings: torch.Tensor,
-    candidate_product_surface_embeddings: torch.Tensor,
-    num_item_hashes: int,
-    num_author_hashes: int,
-    proj_weight: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Reduce candidate sequence features: post + author + surface."""
-    B, C, _, D = candidate_post_embeddings.shape
-    post_reshaped = candidate_post_embeddings.reshape(B, C, num_item_hashes * D)
-    author_reshaped = candidate_author_embeddings.reshape(B, C, num_author_hashes * D)
-    combined = torch.cat([
-        post_reshaped,
-        author_reshaped,
-        candidate_product_surface_embeddings
-    ], dim=-1)
-    candidate_embedding = torch.matmul(combined.to(proj_weight.dtype), proj_weight.t())
-    candidate_padding_mask = (candidate_post_hashes[:, :, 0] != 0)
-    return candidate_embedding, candidate_padding_mask
-
-
-@dataclass
-class PhoenixModelConfig:
-    """Configuration for the Phoenix recommendation model."""
-    emb_size: int
-    num_actions: int
-    product_surface_vocab_size: int = 16
-    fprop_dtype: torch.dtype = torch.bfloat16
-    hash_config: HashConfig = field(default_factory=HashConfig)
-
-
-class PhoenixModel(nn.Module):
+class RotaryEmbedding(nn.Module):
     """
-    Phoenix recommendation model with asymmetric attention for history and candidates.
-    
-    Features:
-    - User + History + Candidates three-stage input
-    - Multi-hash compression + projection
-    - Signed multi-hot action embeddings
-    - Product surface categorical embedding
+    Implements Rotary Positional Embeddings (RoPE) to provide 
+    relative positional information to the Transformer.
     """
+    def __init__(self, dim, max_seq_len=5000):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
 
-    def __init__(self, config: PhoenixModelConfig, transformer_module: nn.Module):
+    def forward(self, x):
+        seq_len = x.shape[1]
+        t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().unsqueeze(0)
+        sin = emb.sin().unsqueeze(0)
+        return x * cos + torch.roll(x, shifts=-1, dims=-1) * sin
+
+class Expert(nn.Module):
+    """ Standard Feed-Forward Network used as an individual expert within the MoE layer """
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, dim))
+    def forward(self, x):
+        return self.net(x)
+
+class EfficientMoELayer(nn.Module):
+    """
+    Sparse Mixture-of-Experts layer that routes tokens to the Top-K experts 
+    based on a learned gating mechanism.
+    """
+    def __init__(self, dim, num_experts=4, top_k=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.experts = nn.ModuleList([Expert(dim, dim * 2) for _ in range(num_experts)])
+        self.gate = nn.Linear(dim, num_experts)
+
+    def forward(self, x: torch.Tensor):
+        orig_shape = x.shape
+        if len(orig_shape) == 2: x = x.unsqueeze(1)
+        B, S, D = x.shape
+        x_flat = x.view(-1, D)
+        
+        logits = self.gate(x_flat)
+        weights = F.softmax(logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_idx = torch.topk(weights, self.top_k, dim=-1)
+        topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+        
+        routed = torch.zeros_like(x_flat)
+        flat_token_idx = torch.arange(x_flat.shape[0], device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
+        flat_expert_idx = topk_idx.reshape(-1)
+        flat_weights = topk_weights.reshape(-1).unsqueeze(-1)
+        
+        for e_id in range(self.num_experts):
+            mask = (flat_expert_idx == e_id)
+            if mask.any():
+                token_idx = flat_token_idx[mask]
+                expert_out = self.experts[e_id](x_flat[token_idx])
+                routed.index_add_(0, token_idx, expert_out * flat_weights[mask].to(expert_out.dtype))
+        
+        moe_out = routed.view(B, S, D)
+        if len(orig_shape) == 2: moe_out = moe_out.squeeze(1)
+        return moe_out, logits
+
+class TransformerMoEBlock(nn.Module):
+    """ A Transformer layer replacing the standard MLP with a Mixture-of-Experts (MoE) component """
+    def __init__(self, dim, nhead, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, nhead, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.moe = EfficientMoELayer(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        attn_out, _ = self.attn(x, x, x, key_padding_mask=mask)
+        x = self.norm1(x + self.dropout(attn_out))
+        moe_out, router_logits = self.moe(x)
+        x = self.norm2(x + self.dropout(moe_out))
+        return x, router_logits
+
+class UltimateTwoTowerMoERecModel(nn.Module):
+    """
+    Target-Aware Two-Tower Model using MoE and Cross-Attention to allow 
+    the user representation to dynamically adapt to candidate items.
+    """
+    def __init__(self, config: RecModelConfig):
         super().__init__()
         self.config = config
-        self.transformer = transformer_module
+        D = config.embed_dim
 
-        D = config.emb_size
-        h = config.hash_config
+        self.item_embedding = nn.Embedding(config.vocab_size, D)
+        self.category_embedding = nn.Embedding(config.num_categories, D)
+        self.rope = RotaryEmbedding(D, config.max_seq_len)
 
-        self.user_proj = nn.Linear(h.num_user_hashes * D, D, bias=False)
-        self.history_proj = nn.Linear(
-            (h.num_item_hashes + h.num_author_hashes) * D + 2 * D, D, bias=False
-        )
-        self.candidate_proj = nn.Linear(
-            (h.num_item_hashes + h.num_author_hashes) * D + D, D, bias=False
-        )
+        self.user_blocks = nn.ModuleList([
+            TransformerMoEBlock(D, config.num_heads, config.dropout) for _ in range(config.num_layers)
+        ])
+        self.user_norm = nn.LayerNorm(D)
 
-        self.action_projection = nn.Parameter(torch.empty(config.num_actions, D))
-        self.product_surface_emb = nn.Embedding(config.product_surface_vocab_size, D)
-        self.unembeddings = nn.Parameter(torch.empty(config.num_actions, D))
-        self.final_norm = RMSNorm(D)  # Assuming RMSNorm is defined in transformer.py or imported
+        self.item_moe = EfficientMoELayer(D, config.num_experts, config.top_k)
+        self.item_norm = nn.LayerNorm(D)
 
-        self._init_weights()
+        self.cross_attn = nn.MultiheadAttention(D, config.num_heads, dropout=config.dropout, batch_first=True)
 
-    def _init_weights(self):
-        for m in [self.user_proj, self.history_proj, self.candidate_proj]:
-            nn.init.xavier_uniform_(m.weight)
-        for p in [self.action_projection, self.unembeddings]:
-            nn.init.xavier_uniform_(p)
-        nn.init.normal_(self.product_surface_emb.weight, mean=0.0, std=0.02)
-
-    def _get_action_embeddings(self, actions: torch.Tensor) -> torch.Tensor:
-        """Convert multi-hot actions to signed embeddings."""
-        actions_signed = (2.0 * actions.float() - 1.0)
-        action_emb = torch.matmul(actions_signed, self.action_projection.t())
-        valid_mask = (actions.sum(dim=-1, keepdim=True) > 0).to(action_emb.dtype)
-        return action_emb * valid_mask
-
-    def build_inputs(
-        self,
-        batch: RecsysBatch,
-        recsys_embeddings: RecsysEmbeddings
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Build input embeddings and masks for the transformer."""
-        hist_ps_emb = self.product_surface_emb(batch.history_product_surface.long())
-        cand_ps_emb = self.product_surface_emb(batch.candidate_product_surface.long())
-        hist_act_emb = self._get_action_embeddings(batch.history_actions)
-
-        user_emb_raw, user_mask = block_user_reduce(
-            batch.user_hashes, recsys_embeddings.user_embeddings,
-            self.config.hash_config.num_user_hashes, self.config.emb_size,
-            self.user_proj.weight
-        )
-        user_emb = self.user_proj(user_emb_raw.squeeze(1)).unsqueeze(1)
-
-        hist_emb_raw, hist_mask = block_history_reduce(
-            batch.history_post_hashes, recsys_embeddings.history_post_embeddings,
-            recsys_embeddings.history_author_embeddings, hist_ps_emb, hist_act_emb,
-            self.config.hash_config.num_item_hashes, self.config.hash_config.num_author_hashes,
-            self.history_proj.weight
-        )
-        hist_emb = self.history_proj(hist_emb_raw)
-
-        cand_emb_raw, cand_mask = block_candidate_reduce(
-            batch.candidate_post_hashes, recsys_embeddings.candidate_post_embeddings,
-            recsys_embeddings.candidate_author_embeddings, cand_ps_emb,
-            self.config.hash_config.num_item_hashes, self.config.hash_config.num_author_hashes,
-            self.candidate_proj.weight
-        )
-        cand_emb = self.candidate_proj(cand_emb_raw)
-
-        embeddings = torch.cat([user_emb, hist_emb, cand_emb], dim=1)
-        padding_mask = torch.cat([user_mask, hist_mask, cand_mask], dim=1)
-        candidate_start_offset = user_mask.shape[1] + hist_mask.shape[1]
-
-        return embeddings.to(self.config.fprop_dtype), padding_mask, candidate_start_offset
-
-    def forward(
-        self,
-        batch: RecsysBatch,
-        recsys_embeddings: RecsysEmbeddings
-    ) -> RecsysModelOutput:
-        """Forward pass: output action logits for candidates."""
-        embeddings, padding_mask, cand_offset = self.build_inputs(batch, recsys_embeddings)
-
-        transformer_out = self.transformer(
-            embeddings,
-            candidate_start_offset=cand_offset,
-            padding_mask=padding_mask
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(D * 2, D),
+            nn.GELU(),
+            nn.Linear(D, 1)
         )
 
-        out_embeddings = self.final_norm(transformer_out)
-        candidate_embeddings = out_embeddings[:, cand_offset:, :]
+    def load_balance_loss(self, router_logits_list):
+        """ Calculates the auxiliary loss to ensure balanced expert utilization """
+        loss = 0.0
+        for logits in router_logits_list:
+            probs = F.softmax(logits, dim=-1)
+            avg_prob = probs.mean(dim=0)
+            uniform = torch.ones_like(avg_prob) / self.config.num_experts
+            loss += (avg_prob - uniform).pow(2).mean()
+        return loss
 
-        logits = torch.matmul(
-            candidate_embeddings.to(self.unembeddings.dtype),
-            self.unembeddings.t()
-        )
+    def user_tower(self, history_seq, padding_mask=None):
+        """ Processes user history into a sequence of hidden states """
+        x = self.item_embedding(history_seq)
+        x = self.rope(x)
+        all_routers = []
+        for block in self.user_blocks:
+            x, r = block(x, padding_mask)
+            all_routers.append(r)
+        return self.user_norm(x), all_routers
 
-        return RecsysModelOutput(logits=logits.to(self.config.fprop_dtype))
+    def item_tower(self, candidate_ids, category_ids=None):
+        """ Encodes candidate items and applies MoE for specialized item representation """
+        item_emb = self.item_embedding(candidate_ids)
+        if category_ids is not None:
+            cat_emb = self.category_embedding(category_ids)
+            item_emb = item_emb + cat_emb
+        item_emb, item_routers = self.item_moe(item_emb)
+        return self.item_norm(item_emb), item_routers
+
+    def forward(self, history_seq, candidate_ids, category_ids=None, padding_mask=None):
+        """
+        Main forward pass:
+        1. Extract history sequence features.
+        2. Extract candidate item features.
+        3. Use Cross-Attention (Candidate as Query) to build target-aware user vectors.
+        4. Fuse features and predict ranking logits.
+        """
+        history_hidden, user_routers = self.user_tower(history_seq, padding_mask)
+        item_emb, item_routers = self.item_tower(candidate_ids, category_ids)
+
+        B, Num_Cand, D = item_emb.shape
+        query = item_emb.view(B * Num_Cand, 1, D)
+        key_value = history_hidden.unsqueeze(1).expand(B, Num_Cand, -1, -1).reshape(B * Num_Cand, -1, D)
+
+        attn_out, _ = self.cross_attn(query, key_value, key_value)
+        target_aware_user = attn_out.view(B, Num_Cand, D)
+
+        fused = torch.cat([target_aware_user, item_emb], dim=-1)
+        logits = self.fusion_mlp(fused).squeeze(-1)
+
+        aux_loss = self.load_balance_loss(user_routers + [item_routers])
+
+        return logits, aux_loss
+
+if __name__ == "__main__":
+    config = RecModelConfig()
+    model = UltimateTwoTowerMoERecModel(config)
+
+    B, Seq, Cand = 32, 20, 50
+    history = torch.randint(0, config.vocab_size, (B, Seq))
+    candidates = torch.randint(0, config.vocab_size, (B, Cand))
+    categories = torch.randint(0, config.num_categories, (B, Cand))
+
+    logits, aux_loss = model(history, candidates, categories)
+    print(f"Logits shape: {logits.shape}")
+    print(f"Auxiliary Loss: {aux_loss.item():.4f}")
